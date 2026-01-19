@@ -5,5 +5,5 @@ This is a collection of JupyterLab notebooks for exploring Fourier analysis we u
 
 
 - [Finding a mystery function using combinations of sine waves](https://guraltsev.github.io/cookies-fourier/lab/index.html?workspace=Fourier_01&mode=single-document)
-- [Approximating a square wave using sine waves](https://guraltsev.github.io/cookies-fourier/lab/index.html?workspace=Fourier_01&mode=single-document)
+- [Approximating a square wave using sine waves](https://guraltsev.github.io/cookies-fourier/lab/index.html?workspace=Fourier_02&mode=single-document)
 
