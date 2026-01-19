@@ -4,5 +4,5 @@
 This is a collection of JupyterLab notebooks for exploring Fourier analysis we use at [Cookies for Proof](https://www.cookiesforproof.org/cookies-central) at the Fayetteville Public Library. 
 
 
-- [Finding a mystery function using combinations of sine waves](guraltsev.github.io/cookies-fourier/)
+- [Finding a mystery function using combinations of sine waves](https://guraltsev.github.io/cookies-fourier/)
 
