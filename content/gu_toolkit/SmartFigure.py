@@ -97,19 +97,22 @@ import re
 import time
 import warnings
 import logging
-from typing import Any, Callable, Hashable, Optional, Sequence, Tuple, Union, Dict, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Any, Callable, Hashable, Optional, Sequence, Tuple, Union, Dict, Iterator, List
 
 import ipywidgets as widgets
 import numpy as np
 import plotly.graph_objects as go
 import sympy as sp
-from IPython.display import Javascript, display
+from IPython.display import display
 from sympy.core.expr import Expr
 from sympy.core.symbol import Symbol
 
 # Internal imports (assumed to exist in the same package)
 from .InputConvert import InputConvert
 from .numpify import numpify_cached
+from .PlotlyPane import PlotlyPane, PlotlyPaneStyle
 from .SmartSlider import SmartFloatSlider
 
 
@@ -120,6 +123,42 @@ logger = logging.getLogger(__name__)
 if not logger.handlers:
     logger.addHandler(logging.NullHandler())
 
+_FIGURE_STACK: List["SmartFigure"] = []
+
+
+def _current_figure() -> Optional["SmartFigure"]:
+    if not _FIGURE_STACK:
+        return None
+    return _FIGURE_STACK[-1]
+
+
+def _push_current_figure(fig: "SmartFigure", display_on_enter: bool) -> None:
+    _FIGURE_STACK.append(fig)
+    if display_on_enter and not fig._has_been_displayed:
+        display(fig)
+        fig._has_been_displayed = True
+
+
+def _pop_current_figure(fig: "SmartFigure") -> None:
+    if not _FIGURE_STACK:
+        return
+    if _FIGURE_STACK[-1] is fig:
+        _FIGURE_STACK.pop()
+        return
+    for i in range(len(_FIGURE_STACK) - 1, -1, -1):
+        if _FIGURE_STACK[i] is fig:
+            del _FIGURE_STACK[i]
+            break
+
+
+@contextmanager
+def _use_figure(fig: "SmartFigure", display_on_enter: bool) -> Iterator["SmartFigure"]:
+    _push_current_figure(fig, display_on_enter=display_on_enter)
+    try:
+        yield fig
+    finally:
+        _pop_current_figure(fig)
+
 
 # -----------------------------
 # Small type aliases
@@ -128,6 +167,35 @@ NumberLike = Union[int, float]
 NumberLikeOrStr = Union[int, float, str]
 RangeLike = Tuple[NumberLikeOrStr, NumberLikeOrStr]
 VisibleSpec = Union[bool, str]  # Plotly uses True/False or the string "legendonly".
+
+
+@dataclass(frozen=True)
+class ParamConfig:
+    """Reusable configuration for parameter sliders."""
+    value: Optional[NumberLike] = None
+    min: Optional[NumberLike] = None
+    max: Optional[NumberLike] = None
+    step: Optional[NumberLike] = None
+
+    def merged(self, override: "ParamConfig") -> "ParamConfig":
+        return ParamConfig(
+            value=override.value if override.value is not None else self.value,
+            min=override.min if override.min is not None else self.min,
+            max=override.max if override.max is not None else self.max,
+            step=override.step if override.step is not None else self.step,
+        )
+
+    def to_kwargs(self) -> Dict[str, NumberLike]:
+        return {
+            key: value
+            for key, value in {
+                "value": self.value,
+                "min": self.min,
+                "max": self.max,
+                "step": self.step,
+            }.items()
+            if value is not None
+        }
 
 
 # =============================================================================
@@ -243,25 +311,22 @@ class OneShotOutput(widgets.Output):
 
 class SmartFigureLayout:
     """
-    Manages the visual structure, CSS/JS injection, and widget hierarchy of a SmartFigure.
+    Manages the visual structure and widget hierarchy of a SmartFigure.
     
     This class isolates all the "messy" UI code (CSS strings, JavaScript injection,
     VBox/HBox nesting) from the mathematical logic.
 
     Responsibilities:
     - Building the HBox/VBox structure.
-    - Injecting the specific CSS/JS for aspect ratio handling.
+    - Providing the plot container and layout toggles.
     - Exposing containers for Plots, Parameters, and Info.
     - Handling layout toggles (e.g. full width, sidebar visibility).
     """
 
     def __init__(self, title: str = "") -> None:
-        # 1. CSS and JS Injection
-        #    Invisible widgets that carry the bootstrap code for the browser.
-        self._css_widget = widgets.HTML(value=self._get_css())
-        self._js_widget = widgets.Output(layout=widgets.Layout(width="0px", height="0px", display="none"))
-        
-        # 2. Title Bar
+        self._reflow_callback: Optional[Callable[[], None]] = None
+
+        # 1. Title Bar
         #    We use HTMLMath for proper LaTeX title rendering.
         self.title_html = widgets.HTMLMath(value=title, layout=widgets.Layout(margin="0px"))
         self.full_width_checkbox = widgets.Checkbox(
@@ -277,23 +342,44 @@ class SmartFigureLayout:
             ),
         )
 
-        # 3. Plot Area (The "Left" Panel)
-        #    Note: CSS aspect-ratio controls height. We do NOT set a fixed height here.
+        # 2. Plot Area (The "Left" Panel)
+        #    Ensure a real pixel height for Plotly sizing.
         self.plot_container = widgets.Box(
             children=(),
             layout=widgets.Layout(
-                width="100%", min_width="320px", margin="0px", padding="0px", flex="1 1 560px"
+                width="100%",
+                height="60vh",
+                min_width="320px",
+                min_height="260px",
+                margin="0px",
+                padding="0px",
+                flex="1 1 560px",
             ),
         )
-        self.plot_container.add_class("sf-plot-aspect")
 
-        # 4. Controls Sidebar (The "Right" Panel)
+        # 3. Controls Sidebar (The "Right" Panel)
         #    Initially hidden (display="none") until parameters or info widgets are added.
         self.params_header = widgets.HTML("<b>Parameters</b>", layout=widgets.Layout(display="none", margin="0"))
-        self.params_box = widgets.VBox(layout=widgets.Layout(width="100%", display="none"))
-        
+        self.params_box = widgets.VBox(
+            layout=widgets.Layout(
+                width="100%",
+                display="none",
+                padding="8px",
+                border="1px solid rgba(15,23,42,0.08)",
+                border_radius="10px",
+            )
+        )
+
         self.info_header = widgets.HTML("<b>Info</b>", layout=widgets.Layout(display="none", margin="10px 0 0 0"))
-        self.info_box = widgets.VBox(layout=widgets.Layout(width="100%", display="none"))
+        self.info_box = widgets.VBox(
+            layout=widgets.Layout(
+                width="100%",
+                display="none",
+                padding="8px",
+                border="1px solid rgba(15,23,42,0.08)",
+                border_radius="10px",
+            )
+        )
 
         self.sidebar_container = widgets.VBox(
             [self.params_header, self.params_box, self.info_header, self.info_box],
@@ -303,7 +389,7 @@ class SmartFigureLayout:
             ),
         )
 
-        # 5. Main Content Wrapper (Flex)
+        # 4. Main Content Wrapper (Flex)
         #    Uses flex-wrap so the sidebar drops below the plot on narrow screens.
         self.content_wrapper = widgets.Box(
             [self.plot_container, self.sidebar_container],
@@ -313,15 +399,14 @@ class SmartFigureLayout:
             ),
         )
 
-        # 6. Root Widget
+        # 5. Root Widget
         self.root_widget = widgets.VBox(
-            [self._css_widget, self._js_widget, self._titlebar, self.content_wrapper],
+            [self._titlebar, self.content_wrapper],
             layout=widgets.Layout(width="100%")
         )
 
         # Wire up internal logic
         self.full_width_checkbox.observe(self._on_full_width_change, names="value")
-        self._inject_js()
 
     @property
     def output_widget(self) -> OneShotOutput:
@@ -352,6 +437,15 @@ class SmartFigureLayout:
         show_sidebar = has_params or has_info
         self.sidebar_container.layout.display = "flex" if show_sidebar else "none"
 
+    def set_plot_widget(
+        self,
+        widget: widgets.Widget,
+        *,
+        reflow_callback: Optional[Callable[[], None]] = None,
+    ) -> None:
+        self.plot_container.children = (widget,)
+        self._reflow_callback = reflow_callback
+
     def _on_full_width_change(self, change: Dict[str, Any]) -> None:
         """Toggles CSS flex properties for full-width mode."""
         is_full = change["new"]
@@ -375,98 +469,8 @@ class SmartFigureLayout:
             sidebar_layout.max_width = "400px"
             sidebar_layout.width = "auto"
             sidebar_layout.padding = "0px 0px 0px 10px"
-
-    def _get_css(self) -> str:
-        """
-        Returns the CSS needed for the aspect-ratio hack and drag handle.
-        """
-        return """
-        <style>
-        /* Host plot panel: height governed by aspect-ratio. */
-        .sf-plot-aspect {
-            position: relative; width: 100%;
-            aspect-ratio: var(--sf-ar, 1.3333333333);
-            min-height: 260px; box-sizing: border-box;
-        }
-        /* Force Plotly to fill the host container */
-        .sf-plot-aspect .js-plotly-plot, .sf-plot-aspect .plotly-graph-div {
-            width: 100% !important; height: 100% !important;
-        }
-        /* Drag handle (bottom grip) */
-        .sf-aspect-handle {
-            position: absolute; left: 0; right: 0; bottom: 0; height: 14px;
-            cursor: ns-resize; z-index: 10;
-        }
-        .sf-aspect-handle::after {
-            content: ""; display: block; width: 56px; height: 4px;
-            margin: 5px auto; border-radius: 999px; background: rgba(0,0,0,0.25);
-        }
-        .sf-aspect-handle:hover::after { background: rgba(0,0,0,0.40); }
-        </style>
-        """
-
-    def _inject_js(self) -> None:
-        """
-        Injects the JavaScript Logic for the resize handle and Plotly resizing.
-        """
-        # Kept inline to ensure the file is self-contained.
-        js_code = r"""
-        (function () {
-            if (window.__smartfigure_plotly_aspect_resizer_installed) return;
-            window.__smartfigure_plotly_aspect_resizer_installed = true;
-
-            function safeResizePlotly(gd) {
-                try { if (window.Plotly && Plotly.Plots) Plotly.Plots.resize(gd); } catch (e) {}
-            }
-            
-            function ensureHandle(host) {
-                if (host.__sf_handle_installed) return;
-                host.__sf_handle_installed = true;
-                const handle = document.createElement('div');
-                handle.className = 'sf-aspect-handle';
-                host.appendChild(handle);
-                
-                let dragging = false, startY = 0, startH = 0;
-                
-                function onMove(ev) {
-                    if (!dragging) return;
-                    const newH = Math.max(180, Math.min(2200, startH + (ev.clientY - startY)));
-                    const rect = host.getBoundingClientRect();
-                    host.style.setProperty('--sf-ar', String((rect.width || 1) / newH));
-                    const gd = host.querySelector('.js-plotly-plot');
-                    if (gd) safeResizePlotly(gd);
-                }
-                function onUp(ev) {
-                    dragging = false; 
-                    window.removeEventListener('pointermove', onMove, true);
-                    window.removeEventListener('pointerup', onUp, true);
-                }
-                handle.addEventListener('pointerdown', (ev) => {
-                    ev.preventDefault(); dragging = true; startY = ev.clientY;
-                    startH = host.getBoundingClientRect().height || 1;
-                    window.addEventListener('pointermove', onMove, true);
-                    window.addEventListener('pointerup', onUp, true);
-                });
-            }
-
-            function attachAll() {
-                document.querySelectorAll('.sf-plot-aspect').forEach(ensureHandle);
-                document.querySelectorAll('.js-plotly-plot').forEach(gd => {
-                    if (!gd.__smartfigure_ro) {
-                        const ro = new ResizeObserver(() => safeResizePlotly(gd));
-                        ro.observe(gd);
-                        gd.__smartfigure_ro = ro;
-                    }
-                });
-            }
-
-            const mo = new MutationObserver(() => attachAll());
-            mo.observe(document.body, { childList: true, subtree: true });
-            setTimeout(attachAll, 1000); 
-        })();
-        """
-        with self._js_widget:
-            display(Javascript(js_code))
+        if self._reflow_callback is not None:
+            self._reflow_callback()
 
 
 # =============================================================================
@@ -489,14 +493,25 @@ class ParameterManager:
     from the "rendering" of the figure.
     """
 
-    def __init__(self, render_callback: Callable[[str, Any], None], layout_box: widgets.Box) -> None:
+    def __init__(
+        self,
+        render_callback: Callable[[str, Any], None],
+        layout_box: widgets.Box,
+        defaults: Optional[ParamConfig] = None,
+    ) -> None:
         self._sliders: Dict[Symbol, SmartFloatSlider] = {}
         self._hooks: Dict[Hashable, Callable[[Dict, Any], Any]] = {}
         self._hook_counter: int = 0
         self._render_callback = render_callback
         self._layout_box = layout_box # The VBox where sliders live
+        self._defaults = defaults or ParamConfig(value=0.0, min=-1.0, max=1.0, step=0.01)
 
-    def add_param(self, symbol: Symbol, **kwargs: Any) -> SmartFloatSlider:
+    def add_param(
+        self,
+        symbol: Symbol,
+        config: Optional[ParamConfig] = None,
+        **kwargs: Any,
+    ) -> SmartFloatSlider:
         """
         Create or reuse a slider for the given symbol.
 
@@ -504,21 +519,24 @@ class ParameterManager:
         ----------
         symbol : sympy.Symbol
             The parameter symbol.
+        config : ParamConfig, optional
+            Structured configuration for the slider.
         **kwargs :
             Options for the slider (min, max, value, step).
         """
         if symbol in self._sliders:
             return self._sliders[symbol]
 
-        defaults = {'value': 0.0, 'min': -1.0, 'max': 1.0, 'step': 0.01}
-        config = {**defaults, **kwargs}
+        config_overrides = config or ParamConfig()
+        merged_config = self._defaults.merged(config_overrides)
+        merged_kwargs = {**merged_config.to_kwargs(), **kwargs}
         
         slider = SmartFloatSlider(
             description=f"${sp.latex(symbol)}$",
-            value=float(config['value']),
-            min=float(config['min']),
-            max=float(config['max']),
-            step=float(config['step'])
+            value=float(merged_kwargs["value"]),
+            min=float(merged_kwargs["min"]),
+            max=float(merged_kwargs["max"]),
+            step=float(merged_kwargs["step"]),
         )
         
         # Observe changes
@@ -527,6 +545,40 @@ class ParameterManager:
         self._sliders[symbol] = slider
         self._layout_box.children += (slider,)
         return slider
+
+    def update_limits(
+        self,
+        symbol: Symbol,
+        *,
+        min: Optional[NumberLike] = None,
+        max: Optional[NumberLike] = None,
+        step: Optional[NumberLike] = None,
+    ) -> None:
+        """Update slider limits and step for an existing parameter."""
+        if symbol not in self._sliders:
+            raise KeyError(f"Unknown parameter: {symbol}")
+        slider = self._sliders[symbol]
+        new_min = float(slider.min if min is None else min)
+        new_max = float(slider.max if max is None else max)
+        if new_min > new_max:
+            new_min, new_max = new_max, new_min
+        slider.min = new_min
+        slider.max = new_max
+        if step is not None:
+            step_value = float(step)
+            slider.step = abs(step_value) if step_value != 0 else slider.step
+        slider.value = max(new_min, min(float(slider.value), new_max))
+
+    def update_value(self, symbol: Symbol, value: NumberLike) -> None:
+        """Update a slider value while respecting its current limits."""
+        if symbol not in self._sliders:
+            raise KeyError(f"Unknown parameter: {symbol}")
+        slider = self._sliders[symbol]
+        slider.value = max(float(slider.min), min(float(value), float(slider.max)))
+
+    def update_defaults(self, defaults: ParamConfig) -> None:
+        """Update default slider configuration used for new parameters."""
+        self._defaults = defaults
 
     def get_value(self, symbol: Symbol) -> float:
         """Returns the current float value of a parameter."""
@@ -726,6 +778,10 @@ class SmartPlot:
     def label(self, value: str) -> None:
         self._plot_handle.name = value
 
+    def figure(self) -> "SmartFigure":
+        """Return the SmartFigure that owns this plot."""
+        return self._smart_figure
+
     @property
     def x_domain(self) -> Optional[Tuple[float, float]]:
         return self._x_domain
@@ -865,9 +921,10 @@ class SmartFigure:
     """
     
     __slots__ = [
-        "_layout", "_params", "_info", "_figure", "plots",
+        "_layout", "_params", "_info", "_figure", "_pane", "plots",
         "_x_range", "_y_range", "_sampling_points", "_debug",
-        "_last_relayout", "_render_info_last_log_t", "_render_debug_last_log_t"
+        "_last_relayout", "_render_info_last_log_t", "_render_debug_last_log_t",
+        "_has_been_displayed", "_param_defaults"
     ]
 
     def __init__(
@@ -880,23 +937,83 @@ class SmartFigure:
         self._debug = debug
         self._sampling_points = sampling_points
         self.plots: Dict[str, SmartPlot] = {}
+        self._has_been_displayed = False
 
         # 1. Initialize Layout (View)
         self._layout = SmartFigureLayout()
         
         # 2. Initialize Managers
         # Note: we pass a callback for rendering so params can trigger updates
-        self._params = ParameterManager(self.render, self._layout.params_box)
+        self._param_defaults = ParamConfig(value=0.0, min=-1.0, max=1.0, step=0.01)
+        self._params = ParameterManager(
+            self.render,
+            self._layout.params_box,
+            defaults=self._param_defaults,
+        )
         self._info = InfoPanelManager(self._layout.info_box)
 
         # 3. Initialize Plotly Figure
         self._figure = go.FigureWidget()
         self._figure.update_layout(
-            autosize=True, template="plotly_white", showlegend=True, margin=dict(l=20, r=20, t=20, b=20),
-            xaxis=dict(zeroline=True, zerolinewidth=2, zerolinecolor="black", showline=True, ticks="outside"),
-            yaxis=dict(zeroline=True, zerolinewidth=2, zerolinecolor="black", showline=True, ticks="outside"),
+            autosize=True,
+            template="plotly_white",
+            showlegend=True,
+            margin=dict(l=48, r=28, t=48, b=44),
+            font=dict(
+                family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+                size=14,
+                color="#1f2933",
+            ),
+            paper_bgcolor="#ffffff",
+            plot_bgcolor="#f8fafc",
+            legend=dict(
+                bgcolor="rgba(255,255,255,0.7)",
+                bordercolor="rgba(15,23,42,0.08)",
+                borderwidth=1,
+            ),
+            xaxis=dict(
+                zeroline=True,
+                zerolinewidth=1.5,
+                zerolinecolor="#334155",
+                showline=True,
+                linecolor="#94a3b8",
+                linewidth=1,
+                mirror=True,
+                ticks="outside",
+                tickcolor="#94a3b8",
+                ticklen=6,
+                showgrid=True,
+                gridcolor="rgba(148,163,184,0.35)",
+                gridwidth=1,
+            ),
+            yaxis=dict(
+                zeroline=True,
+                zerolinewidth=1.5,
+                zerolinecolor="#334155",
+                showline=True,
+                linecolor="#94a3b8",
+                linewidth=1,
+                mirror=True,
+                ticks="outside",
+                tickcolor="#94a3b8",
+                ticklen=6,
+                showgrid=True,
+                gridcolor="rgba(148,163,184,0.35)",
+                gridwidth=1,
+            ),
         )
-        self._layout.plot_container.children = (self._figure,)
+        self._pane = PlotlyPane(
+            self._figure,
+            style=PlotlyPaneStyle(
+                padding_px=8,
+                border="1px solid rgba(15,23,42,0.08)",
+                border_radius_px=10,
+                overflow="hidden",
+            ),
+            autorange_mode="none",
+            defer_reveal=True,
+        )
+        self._layout.set_plot_widget(self._pane.widget, reflow_callback=self._pane.reflow)
 
         # 4. Set Initial State
         self.x_range = x_range
@@ -931,6 +1048,16 @@ class SmartFigure:
         Acts like a dictionary of `{Symbol: Slider}` for backward compatibility.
         """
         return self._params
+
+    @property
+    def param_defaults(self) -> ParamConfig:
+        """Default slider configuration applied to newly added parameters."""
+        return self._param_defaults
+
+    @param_defaults.setter
+    def param_defaults(self, defaults: ParamConfig) -> None:
+        self._param_defaults = defaults
+        self._params.update_defaults(defaults)
     
     @property
     def info_output(self) -> Dict[Hashable, widgets.Output]:
@@ -1067,11 +1194,16 @@ class SmartFigure:
                  except Exception as e:
                      warnings.warn(f"Hook {h_id} failed: {e}")
 
-    def add_param(self, symbol: Symbol, **kwargs: Any) -> SmartFloatSlider:
+    def add_param(
+        self,
+        symbol: Symbol,
+        config: Optional[ParamConfig] = None,
+        **kwargs: Any,
+    ) -> SmartFloatSlider:
         """
         Add a SmartFloatSlider parameter manually.
         """
-        slider = self._params.add_param(symbol, **kwargs)
+        slider = self._params.add_param(symbol, config=config, **kwargs)
         self._layout.update_sidebar_visibility(self._params.has_params, self._info.has_info)
         return slider
 
@@ -1115,7 +1247,11 @@ class SmartFigure:
         """
         Register a callback to run when *any* parameter value changes.
         """
-        return self._params.add_hook(callback, hook_id, fig=self)
+        def _wrapped(change: Dict, fig: SmartFigure) -> Any:
+            with _use_figure(self, display_on_enter=False):
+                return callback(change, self)
+
+        return self._params.add_hook(_wrapped, hook_id, fig=self)
 
     # --- Internal / Plumbing ---
 
@@ -1141,4 +1277,37 @@ class SmartFigure:
         Special method called by IPython to display the object.
         Uses IPython.display.display() to render the underlying widget.
         """
+        self._has_been_displayed = True
         display(self._layout.output_widget)
+
+    def __enter__(self) -> "SmartFigure":
+        _push_current_figure(self, display_on_enter=True)
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        _pop_current_figure(self)
+
+
+def plot(
+    var: Symbol,
+    func: Expr,
+    parameters: Optional[Sequence[Symbol]] = None,
+    id: Optional[str] = None,
+    x_domain: Optional[RangeLike] = None,
+    sampling_points: Optional[Union[int, str]] = None,
+) -> SmartPlot:
+    """
+    Plot a SymPy expression on the current figure, or create a new figure per call.
+    """
+    fig = _current_figure()
+    if fig is None:
+        fig = SmartFigure()
+        display(fig)
+    return fig.plot(
+        var,
+        func,
+        parameters=parameters,
+        id=id,
+        x_domain=x_domain,
+        sampling_points=sampling_points,
+    )

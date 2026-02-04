@@ -83,12 +83,30 @@ a = SymbolFamily('a')
 b = SymbolFamily('b')
 c = SymbolFamily('c')
 
+A = SymbolFamily('A')
+B = SymbolFamily('B')
+C = SymbolFamily('C')
+
 
 x = SymbolFamily('x')
 y = SymbolFamily('y')
 z = SymbolFamily('z')
 t = SymbolFamily('t')
-__all__+=["a","b","c","x","y","z","t"]
+r = SymbolFamily('r')
+u = SymbolFamily('u')
+v = SymbolFamily('v')
+w = SymbolFamily('w')
+s = SymbolFamily('s')
+alpha = SymbolFamily('α')
+beta = SymbolFamily('β')
+gamma = SymbolFamily('γ')
+delta = SymbolFamily('δ')
+phi = SymbolFamily('φ')
+psi = SymbolFamily('ψ')
+theta = SymbolFamily('θ')
+tau = SymbolFamily('τ')
+rho = SymbolFamily('ρ')
+__all__+=["a","b","c","A","B","C","x","y","z","t","s","r","u","v","w","alpha","beta","delta", "phi","psi","gamma","tau","theta", "rho"]
 
 
 k = SymbolFamily("k", integer=True)
@@ -104,7 +122,45 @@ __all__+=["f","g","h"]
 
 
 
+class Infix:
+    """Generic infix operator used as: a |OP| b."""
+    __slots__ = ("func",)
+
+    def __init__(self, func):
+        self.func = func
+
+    def __ror__(self, left):
+        return _InfixPartial(self.func, left)
+
+
+class _InfixPartial:
+    __slots__ = ("func", "left")
+
+    def __init__(self, func, left):
+        self.func = func
+        self.left = left
+
+    def __or__(self, right):
+        return self.func(self.left, right)
+
+eq = Infix(sp.Eq)
+lt = Infix(sp.Lt)
+le = Infix(sp.Le)
+gt = Infix(sp.Gt)
+ge = Infix(sp.Ge)
+__all__+=["Infix", "eq", "lt", "le", "gt", "ge"]
+
+## Demo:
+# x, y = sp.symbols("x y")
+# expr1 = x + 1
+# expr2 = 2*y
+
+# print(expr1 | eq | expr2)      # Eq(x + 1, 2*y)
+# print((x**2) | eq | (y**2))    # Eq(x**2, y**2)
+
 
 from IPython.display import Latex 
 __all__+=["Latex"]
 
+from pprint import pprint
+__all__+=["pprint"]
